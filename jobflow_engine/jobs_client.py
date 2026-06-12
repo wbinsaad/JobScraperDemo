@@ -22,13 +22,17 @@ class JobsClient:
     Generic HTTP client for fetching jobs from configured job sources.
     """
     
-    def __init__(self, base_url: str | None = None):
+    def __init__(
+        self,
+        http_client: httpx.AsyncClient,
+        base_url: str | None = None,
+    ) -> None:
+        self.http_client = http_client
         self.base_url = (base_url or settings.jobs_api_url).rstrip("/")
 
     async def fetch_source(
         self,
-        source: JobSource,
-        client: httpx.AsyncClient,
+        source: JobSource
     ) -> list[dict[str, Any]]:
         """
         Fetch jobs from a single configured source.
@@ -50,7 +54,10 @@ class JobsClient:
         )
 
         try:
-            response = await client.get(url, timeout=source.timeout_seconds)
+            response = await self.http_client.get(
+                url,
+                timeout=source.timeout_seconds,
+            )
             response.raise_for_status()
 
         except httpx.HTTPStatusError as exc:
@@ -117,40 +124,27 @@ class JobsClient:
             "Fetching all enabled job sources | enabled_source_count=%s",
             len(enabled_sources),
         )
+        tasks = [
+            self._safe_fetch_source(source)
+            for source in enabled_sources
+        ]
 
-        results: dict[str, list[dict[str, Any]]] = {}
-
-        async with httpx.AsyncClient() as client:
-            tasks = [
-                self._safe_fetch_source(source=source, client=client)
-                for source in enabled_sources
-            ]
-
-            source_results = await asyncio.gather(*tasks)
-
-        for source_name, jobs in source_results:
-            results[source_name] = jobs
-
-        total_jobs = sum(len(jobs) for jobs in results.values())
-
-        logger.info(
-            "Finished fetching all sources | source_count=%s | total_jobs=%s",
-            len(results),
-            total_jobs,
-        )
-
-        return results
+        source_results = await asyncio.gather(*tasks)
+ 
+        return {
+            source_name: jobs
+            for source_name, jobs in source_results
+        }
 
     async def _safe_fetch_source(
         self,
         source: JobSource,
-        client: httpx.AsyncClient,
     ) -> tuple[str, list[dict[str, Any]]]:
         """
         Fetch a source without allowing one failed source to stop all others.
         """
         try:
-            jobs = await self.fetch_source(source=source, client=client)
+            jobs = await self.fetch_source(source)
             return source.name, jobs
 
         except JobFetchError as exc:

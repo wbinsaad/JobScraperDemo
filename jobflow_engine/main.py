@@ -1,11 +1,16 @@
 from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI
+import httpx
+from fastapi import FastAPI, Request
 
 from config import settings
+from engine import JobFlowEngine
 from jobs_client import JobsClient
+from logger import get_logger, setup_logging
+from metrics import PipelineMetrics
+from queue_manager import JobQueue
 from repository import JobSourceRepository
-from logger import setup_logging, get_logger
 
 
 @asynccontextmanager
@@ -15,12 +20,35 @@ async def lifespan(app: FastAPI):
     logger = get_logger(__name__)
     logger.info("Starting %s", settings.app_name)
 
-    yield
+    http_client = httpx.AsyncClient()
+    queue = JobQueue(maxsize=1_000)
+    metrics = PipelineMetrics()
+    engine = JobFlowEngine(
+        queue=queue,
+        metrics=metrics,
+        worker_count=3,
+    )
 
-    logger.info("Shutting down %s", settings.app_name)
+    engine.start()
 
-setup_logging()
-logger = get_logger(__name__)
+    app.state.http_client = http_client
+    app.state.queue = queue
+    app.state.metrics = metrics
+    app.state.engine = engine
+    app.state.source_repository = JobSourceRepository()
+    app.state.jobs_client = JobsClient(http_client=http_client)
+
+    try:
+        yield
+
+    finally:
+        logger.info("Shutting down %s", settings.app_name)
+
+        await engine.stop()
+        await http_client.aclose()
+
+        logger.info("Shutdown complete | service=%s", settings.app_name)
+
 
 app = FastAPI(
     title="jobflow_engine",
@@ -28,34 +56,51 @@ app = FastAPI(
 )
 
 @app.get("/health")
-def health_check():
+def health_check() -> dict[str, str]:
     logger = get_logger(__name__)
     logger.debug("Health check requested")
     return {"status": "healthy"}
 
 @app.post("/fetch-jobs")
-async def fetch_jobs():
-    repository = JobSourceRepository()
+async def fetch_jobs(request: Request) -> dict[str, Any]:
+    logger = get_logger(__name__)
+
+    repository: JobSourceRepository = request.app.state.source_repository
+    jobs_client: JobsClient = request.app.state.jobs_client
+    engine: JobFlowEngine = request.app.state.engine
+    metrics: PipelineMetrics = request.app.state.metrics
+    queue: JobQueue = request.app.state.queue
+
     sources = await repository.get_enabled_sources()
+    jobs_by_source = await jobs_client.fetch_all_sources(sources)
 
-    client = JobsClient()
-    jobs_by_source = await client.fetch_all_sources(sources)
+    fetched_count = sum(len(jobs) for jobs in jobs_by_source.values())
+    metrics.record_fetched(fetched_count)
 
-    counts_by_source = {
-        source_name: len(jobs)
-        for source_name, jobs in jobs_by_source.items()
-    }
-
-    total_fetched = sum(counts_by_source.values())
+    queued_count = await engine.enqueue_jobs(jobs_by_source)
 
     logger.info(
-        "Fetch jobs completed | sources=%s | total_fetched=%s",
-        counts_by_source,
-        total_fetched,
+        "Fetch jobs completed | fetched_count=%s | queued_count=%s | queue_depth=%s",
+        fetched_count,
+        queued_count,
+        queue.depth(),
     )
 
     return {
         "status": "success",
-        "sources": counts_by_source,
-        "total_fetched": total_fetched,
+        "sources": {
+            source_name: len(jobs)
+            for source_name, jobs in jobs_by_source.items()
+        },
+        "fetched_count": fetched_count,
+        "queued_count": queued_count,
+        "queue_depth": queue.depth(),
     }
+
+
+@app.get("/metrics")
+def get_metrics(request: Request) -> dict[str, int]:
+    metrics: PipelineMetrics = request.app.state.metrics
+    queue: JobQueue = request.app.state.queue
+
+    return metrics.snapshot(queue_depth=queue.depth())
