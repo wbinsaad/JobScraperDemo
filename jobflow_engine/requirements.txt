@@ -2,5 +2,8 @@ fastapi
 uvicorn[standard]
 pydantic
 pydantic-settings
+<<<<<<< HEAD
 httpx==0.28.1
+=======
+>>>>>>> c88c465ef1993026688a10ed65b7f9edfdb2ee89
 pytest==9.0.3
