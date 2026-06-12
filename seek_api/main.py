@@ -61,4 +61,4 @@ def health_check():
     Simple health check endpoint.
     Returns 200 OK with a JSON status.
     """
-    return {"status": "ok"}
+    return {"status": "healthy"}
