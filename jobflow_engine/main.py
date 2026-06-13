@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
     engine = JobFlowEngine(
         queue=queue,
         metrics=metrics,
-        worker_count=3,
+        worker_count=1,
     )
 
     engine.start()
@@ -72,12 +72,12 @@ async def fetch_jobs(request: Request) -> dict[str, Any]:
     queue: JobQueue = request.app.state.queue
 
     sources = await repository.get_enabled_sources()
-    jobs_by_source = await jobs_client.fetch_all_sources(sources)
+    source_batches = await jobs_client.fetch_all_sources(sources)
 
-    fetched_count = sum(len(jobs) for jobs in jobs_by_source.values())
+    fetched_count = sum(len(batch.jobs) for batch in source_batches)
     metrics.record_fetched(fetched_count)
 
-    queued_count = await engine.enqueue_jobs(jobs_by_source)
+    queued_count = await engine.enqueue_jobs(source_batches)
 
     logger.info(
         "Fetch jobs completed | fetched_count=%s | queued_count=%s | queue_depth=%s",
@@ -89,8 +89,8 @@ async def fetch_jobs(request: Request) -> dict[str, Any]:
     return {
         "status": "success",
         "sources": {
-            source_name: len(jobs)
-            for source_name, jobs in jobs_by_source.items()
+            batch.source.name: len(batch.jobs)
+            for batch in source_batches
         },
         "fetched_count": fetched_count,
         "queued_count": queued_count,

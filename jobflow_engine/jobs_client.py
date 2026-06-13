@@ -7,7 +7,7 @@ import httpx
 
 from config import settings
 from logger import get_logger
-from models import JobSource
+from models import JobSource, SourceJobBatch
 
 
 logger = get_logger(__name__)
@@ -33,7 +33,7 @@ class JobsClient:
     async def fetch_source(
         self,
         source: JobSource
-    ) -> list[dict[str, Any]]:
+    ) -> SourceJobBatch:
         """
         Fetch jobs from a single configured source.
 
@@ -42,7 +42,7 @@ class JobsClient:
             client: Shared AsyncClient for connection reuse.
 
         Returns:
-            List of raw job dictionaries.
+            SourceJobBatch source with raw job dictionaries.
         """
         endpoint_path = self._normalise_endpoint_path(source.endpoint_path)
         url = f"{self.base_url}{endpoint_path}"
@@ -103,20 +103,17 @@ class JobsClient:
             len(payload),
         )
 
-        return payload
+        return SourceJobBatch(
+            source=source,
+            jobs=payload,
+        )
 
     async def fetch_all_sources(
         self,
         sources: list[JobSource],
-    ) -> dict[str, list[dict[str, Any]]]:
+    ) -> list[SourceJobBatch]:
         """
         Fetch jobs from all enabled sources concurrently.
-
-        Returns:
-            {
-                "linkedin": [...],
-                "seek": [...]
-            }
         """
         enabled_sources = [source for source in sources if source.enabled]
 
@@ -129,23 +126,23 @@ class JobsClient:
             for source in enabled_sources
         ]
 
-        source_results = await asyncio.gather(*tasks)
- 
-        return {
-            source_name: jobs
-            for source_name, jobs in source_results
-        }
+        batches = await asyncio.gather(*tasks)
+
+        return [
+            batch
+            for batch in batches
+            if batch is not None
+        ]
 
     async def _safe_fetch_source(
         self,
         source: JobSource,
-    ) -> tuple[str, list[dict[str, Any]]]:
+    ) -> SourceJobBatch | None:
         """
         Fetch a source without allowing one failed source to stop all others.
         """
         try:
-            jobs = await self.fetch_source(source)
-            return source.name, jobs
+            return await self.fetch_source(source)
 
         except JobFetchError as exc:
             logger.warning(
@@ -153,7 +150,7 @@ class JobsClient:
                 source.name,
                 str(exc),
             )
-            return source.name, []
+            return None
 
     @staticmethod
     def _normalise_endpoint_path(endpoint_path: str) -> str:

@@ -1,10 +1,14 @@
+# jobflow_engine/engine.py
+
 import asyncio
 from typing import Any
 
 from logger import get_logger
 from metrics import PipelineMetrics
 from queue_manager import JobQueue
-
+from transformer import JobTransformationError, JobTransformer
+from validation import JobValidationError, JobValidator
+from models import SourceJobBatch
 
 logger = get_logger(__name__)
 
@@ -23,6 +27,8 @@ class JobFlowEngine:
         self.queue = queue
         self.metrics = metrics
         self.worker_count = worker_count
+        self.validator = JobValidator()
+        self.transformer = JobTransformer()
         self._worker_tasks: set[asyncio.Task[None]] = set()
         self._running = False
 
@@ -59,32 +65,35 @@ class JobFlowEngine:
         for task in self._worker_tasks:
             task.cancel()
 
-        results = await asyncio.gather(
+        await asyncio.gather(
             *self._worker_tasks,
             return_exceptions=True,
         )
 
         self._worker_tasks.clear()
 
-        logger.info("JobFlowEngine stopped | task_results=%s", len(results))
+        logger.info("JobFlowEngine stopped")
 
-    async def enqueue_jobs(self, jobs_by_source: dict[str, list[dict[str, Any]]]) -> int:
-        """
-        Enqueue fetched jobs for background processing.
-        """
+    async def enqueue_jobs(self, source_batches: list[SourceJobBatch]) -> int:
         queued_count = 0
 
-        for source_name, jobs in jobs_by_source.items():
-            for job in jobs:
-                enriched_job = {
-                    "source": source_name,
-                    "raw_job": job,
-                }
-
-                await self.queue.enqueue(enriched_job)
+        for batch in source_batches:
+            for job in batch.jobs:
+                await self.queue.enqueue(
+                    {
+                        "source": batch.source.name,
+                        "raw_job": job,
+                        "field_mapping": batch.source.field_mapping,
+                    }
+                )
                 queued_count += 1
 
         self.metrics.record_queued(queued_count)
+        
+        """
+        queued_count = total number of jobs you added to the queue
+        queue_depth  = number of jobs still waiting in the queue right now
+        """
 
         logger.info(
             "Jobs enqueued | queued_count=%s | queue_depth=%s",
@@ -124,19 +133,34 @@ class JobFlowEngine:
         job_event: dict[str, Any],
         worker_id: int,
     ) -> None:
-        """
-        Temporary processing logic.
-        """
-        source = job_event.get("source", "unknown")
-        raw_job = job_event.get("raw_job", {})
+        try:
+            queue_event = self.validator.validate_queue_event(job_event)
 
-        job_id = raw_job.get("job_id") or raw_job.get("id") or "unknown"
+            transformed_job = self.transformer.transform(
+                source=queue_event.source,
+                raw_job=queue_event.raw_job,
+                field_mapping=queue_event.field_mapping,
+            )
+
+            canonical_job = self.validator.validate_canonical_job(transformed_job)
+
+        except (JobValidationError, JobTransformationError) as exc:
+            self.metrics.record_failed()
+
+            logger.warning(
+                "Job rejected | worker_id=%s | reason=%s | raw_event=%s",
+                worker_id,
+                str(exc),
+                job_event,
+            )
+            return
 
         logger.info(
-            "Processing job | worker_id=%s | source=%s | job_id=%s",
+            "validating and Processing job | worker_id=%s | source=%s | external_id=%s | title=%s",
             worker_id,
-            source,
-            job_id,
+            canonical_job.source,
+            canonical_job.external_id,
+            canonical_job.title,
         )
 
         # Simulate async processing point.
@@ -147,6 +171,6 @@ class JobFlowEngine:
         logger.info(
             "Processed job | worker_id=%s | source=%s | job_id=%s",
             worker_id,
-            source,
-            job_id,
+            canonical_job.source,
+            canonical_job.external_id,
         )
