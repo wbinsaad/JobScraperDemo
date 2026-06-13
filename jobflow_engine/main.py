@@ -1,16 +1,19 @@
+from database import AsyncSessionLocal
 from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from config import settings
+from database import close_database, get_session, init_database
 from engine import JobFlowEngine
 from jobs_client import JobsClient
 from logger import get_logger, setup_logging
 from metrics import PipelineMetrics
 from queue_manager import JobQueue
-from repository import JobSourceRepository
+from repository import JobRepository, JobSourceRepository
 
 
 @asynccontextmanager
@@ -19,6 +22,7 @@ async def lifespan(app: FastAPI):
 
     logger = get_logger(__name__)
     logger.info("Starting %s", settings.app_name)
+    await init_database()
 
     http_client = httpx.AsyncClient()
     queue = JobQueue(maxsize=1_000)
@@ -26,6 +30,7 @@ async def lifespan(app: FastAPI):
     engine = JobFlowEngine(
         queue=queue,
         metrics=metrics,
+        session_factory=AsyncSessionLocal,
         worker_count=1,
     )
 
@@ -35,7 +40,6 @@ async def lifespan(app: FastAPI):
     app.state.queue = queue
     app.state.metrics = metrics
     app.state.engine = engine
-    app.state.source_repository = JobSourceRepository()
     app.state.jobs_client = JobsClient(http_client=http_client)
 
     try:
@@ -46,32 +50,64 @@ async def lifespan(app: FastAPI):
 
         await engine.stop()
         await http_client.aclose()
+        await close_database()
 
         logger.info("Shutdown complete | service=%s", settings.app_name)
 
 
 app = FastAPI(
-    title="jobflow_engine",
+    title=settings.app_name,
     lifespan=lifespan,
 )
 
 @app.get("/health")
 def health_check() -> dict[str, str]:
-    logger = get_logger(__name__)
-    logger.debug("Health check requested")
-    return {"status": "healthy"}
+    return {
+        "service": settings.app_name,
+        "status": "healthy",
+        "environment": settings.environment,
+    }
+
+
+@app.post("/seed-sources")
+async def seed_sources(
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, str]:
+    repository = JobSourceRepository(session)
+    await repository.seed_default_sources_if_empty()
+
+    return {
+        "status": "success",
+        "message": "Default sources seeded if empty",
+    }
+
 
 @app.post("/fetch-jobs")
-async def fetch_jobs(request: Request) -> dict[str, Any]:
+async def fetch_jobs(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> dict[str, Any]:
     logger = get_logger(__name__)
 
-    repository: JobSourceRepository = request.app.state.source_repository
+    source_repository = JobSourceRepository(session)
+
+    sources = await source_repository.get_enabled_sources()
+
+    if not sources:
+        logger.warning("No enabled job sources found")
+        return {
+            "status": "no_sources",
+            "sources": {},
+            "fetched_count": 0,
+            "queued_count": 0,
+            "queue_depth": request.app.state.queue.depth(),
+        }
+
     jobs_client: JobsClient = request.app.state.jobs_client
     engine: JobFlowEngine = request.app.state.engine
     metrics: PipelineMetrics = request.app.state.metrics
     queue: JobQueue = request.app.state.queue
 
-    sources = await repository.get_enabled_sources()
     source_batches = await jobs_client.fetch_all_sources(sources)
 
     fetched_count = sum(len(batch.jobs) for batch in source_batches)
@@ -104,3 +140,19 @@ def get_metrics(request: Request) -> dict[str, int]:
     queue: JobQueue = request.app.state.queue
 
     return metrics.snapshot(queue_depth=queue.depth())
+
+
+@app.get("/jobs")
+async def get_jobs(
+    session: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    repository = JobRepository(session)
+    return await repository.list_processed_jobs()
+
+
+@app.get("/dead-letter")
+async def get_dead_letter_jobs(
+    session: AsyncSession = Depends(get_session),
+) -> list[dict[str, Any]]:
+    repository = JobRepository(session)
+    return await repository.list_dead_letter_jobs()

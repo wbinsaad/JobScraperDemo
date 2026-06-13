@@ -1,4 +1,4 @@
-# jobflow_engine/engine.py
+from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 
 import asyncio
 from typing import Any
@@ -9,6 +9,7 @@ from queue_manager import JobQueue
 from transformer import JobTransformationError, JobTransformer
 from validation import JobValidationError, JobValidator
 from models import SourceJobBatch
+from repository import JobRepository
 
 logger = get_logger(__name__)
 
@@ -22,10 +23,12 @@ class JobFlowEngine:
         self,
         queue: JobQueue,
         metrics: PipelineMetrics,
+        session_factory: async_sessionmaker[AsyncSession],
         worker_count: int = 1,
     ) -> None:
         self.queue = queue
         self.metrics = metrics
+        self.session_factory = session_factory
         self.worker_count = worker_count
         self.validator = JobValidator()
         self.transformer = JobTransformer()
@@ -133,44 +136,68 @@ class JobFlowEngine:
         job_event: dict[str, Any],
         worker_id: int,
     ) -> None:
-        try:
-            queue_event = self.validator.validate_queue_event(job_event)
+        source = str(job_event.get("source", "NA"))
+        raw_job = job_event.get("raw_job", {})
 
-            transformed_job = self.transformer.transform(
-                source=queue_event.source,
-                raw_job=queue_event.raw_job,
-                field_mapping=queue_event.field_mapping,
+        async with self.session_factory() as session:
+            repository = JobRepository(session)
+
+            await repository.archive_raw_job(
+                source=source,
+                raw_payload=raw_job,
             )
 
-            canonical_job = self.validator.validate_canonical_job(transformed_job)
+            # Simulate async processing point.
+            await asyncio.sleep(5)
 
-        except (JobValidationError, JobTransformationError) as exc:
-            self.metrics.record_failed()
+            try:
+                queue_event = self.validator.validate_queue_event(job_event)
 
-            logger.warning(
-                "Job rejected | worker_id=%s | reason=%s | raw_event=%s",
+                transformed_job = self.transformer.transform(
+                    source=queue_event.source,
+                    raw_job=queue_event.raw_job,
+                    field_mapping=queue_event.field_mapping,
+                )
+
+                canonical_job = self.validator.validate_canonical_job(transformed_job)
+
+            except (JobValidationError, JobTransformationError) as exc:
+                self.metrics.record_failed()
+
+                await repository.save_dead_letter_job(
+                    source=source,
+                    raw_payload=raw_job,
+                    error_reason=str(exc),
+                )
+
+                logger.warning(
+                    "Job rejected and stored in dead-letter | worker_id=%s | source=%s | reason=%s",
+                    worker_id,
+                    source,
+                    str(exc),
+                )
+                return
+
+            inserted = await repository.save_processed_job(
+                job=canonical_job,
+                match_score=None,
+            )
+
+            if not inserted:
+                logger.info(
+                    "Duplicate job skipped | worker_id=%s | source=%s | external_id=%s",
+                    worker_id,
+                    canonical_job.source,
+                    canonical_job.external_id,
+                )
+                return
+
+            self.metrics.record_processed()
+
+            logger.info(
+                "Processed job stored | worker_id=%s | source=%s | external_id=%s | title=%s",
                 worker_id,
-                str(exc),
-                job_event,
+                canonical_job.source,
+                canonical_job.external_id,
+                canonical_job.title,
             )
-            return
-
-        logger.info(
-            "validating and Processing job | worker_id=%s | source=%s | external_id=%s | title=%s",
-            worker_id,
-            canonical_job.source,
-            canonical_job.external_id,
-            canonical_job.title,
-        )
-
-        # Simulate async processing point.
-        await asyncio.sleep(5)
-
-        self.metrics.record_processed()
-
-        logger.info(
-            "Processed job | worker_id=%s | source=%s | job_id=%s",
-            worker_id,
-            canonical_job.source,
-            canonical_job.external_id,
-        )

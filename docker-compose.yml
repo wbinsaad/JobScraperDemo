@@ -4,11 +4,34 @@ services:
       context: ./jobflow_engine
     ports:
       - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seek_api:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()"]
       interval: 10s
       timeout: 5s
       retries: 3
+      start_period: 10s
+
+  postgres:
+    image: postgres:16
+    container_name: jobflow_postgres
+    environment:
+      POSTGRES_DB: jobflow
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - jobflow_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d jobflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
       start_period: 10s
 
   seek_api:
@@ -23,3 +46,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  jobflow_postgres_data:

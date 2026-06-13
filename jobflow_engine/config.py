@@ -7,6 +7,8 @@ class Settings(BaseSettings):
     jobs_api_url: str = "http://seek_api:8002"
     log_level: str = "INFO"
 
+    database_url: str = "postgresql+asyncpg://postgres:postgres@postgres:5432/jobflow"
+
     class Config:
         env_file = ".env"
 
