@@ -3,6 +3,5 @@ uvicorn[standard]
 pydantic
 pydantic-settings
 httpx==0.28.1
-pytest==9.0.3
 sqlalchemy
 asyncpg
