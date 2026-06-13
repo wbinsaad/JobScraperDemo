@@ -63,9 +63,7 @@ app = FastAPI(
 @app.get("/health")
 def health_check() -> dict[str, str]:
     return {
-        "service": settings.app_name,
-        "status": "healthy",
-        "environment": settings.environment,
+        "status": "healthy"
     }
 
 

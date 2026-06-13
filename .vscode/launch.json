@@ -1,0 +1,27 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug jobflow_engine FastAPI",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": [
+        "main:app",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8000"
+      ],
+      "cwd": "${workspaceFolder}/jobflow_engine",
+      "env": {
+        "APP_NAME": "jobflow_engine",
+        "ENVIRONMENT": "local",
+        "JOBS_API_URL": "http://localhost:8002",
+        "LOG_LEVEL": "DEBUG"
+      },
+      "jinja": true,
+      "console": "integratedTerminal"
+    }
+  ]
+}
