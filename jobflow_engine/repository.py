@@ -18,11 +18,6 @@ logger = get_logger(__name__)
 
 
 class JobSourceRepository:
-    """
-    Temporary source repository.
-
-    Later this should read from the job_sources table.
-    """
     def __init__(self, session: AsyncSession):
         self.session = session
 
